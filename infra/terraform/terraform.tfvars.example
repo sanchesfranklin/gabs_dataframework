@@ -1,0 +1,12 @@
+# Copie este arquivo para terraform.tfvars e preencha os dois primeiros campos.
+#   cp terraform.tfvars.example terraform.tfvars
+
+project_id = "COLE-AQUI-O-ID-DO-PROJETO"
+my_ip_cidr = "COLE-AQUI-SEU-IP/32"
+
+# Opcionais (os valores abaixo já são o padrão):
+# machine_type   = "e2-standard-8"
+# data_disk_gb   = 100
+# use_spot       = false
+# auto_stop_cron = "0 23 * * *"
+# ui_ports       = []

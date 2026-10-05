@@ -1,0 +1,17 @@
+# Terraform: estado e variáveis locais nunca vão para o Git
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+.terraform.lock.hcl.bak
+
+# Segredos
+.env
+*.pem
+*.json.key
+
+# Dags
+dags/*
+!dags/.gitkeep
