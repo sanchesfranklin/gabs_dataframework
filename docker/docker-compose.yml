@@ -1,0 +1,119 @@
+# =============================================================================
+# Gabs Data Framework - Fase 1: núcleo do lakehouse
+#
+#   minio       -> o data lake (object storage compatível com S3)
+#   minio-init  -> roda uma vez, cria os buckets das camadas e termina
+#   jupyter     -> JupyterLab + PySpark + Delta Lake (Spark em modo local)
+#
+# Subir (a partir da RAIZ do repositório):
+#   docker compose -f docker/docker-compose.yml --env-file .env up -d --build
+# Parar:
+#   docker compose -f docker/docker-compose.yml --env-file .env down
+#
+# Todas as portas ficam presas em 127.0.0.1: só quem está "dentro" da máquina
+# enxerga. Na VM, o acesso é por túnel SSH; nada fica exposto à internet.
+# =============================================================================
+
+name: gabs
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # MinIO: guarda os arquivos (Parquet, Delta, JSON...) como objetos em buckets
+  #   porta 9000 = API S3 (é com ela que o Spark conversa)
+  #   porta 9001 = console web (para você navegar nos buckets)
+  # ---------------------------------------------------------------------------
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: gabs-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+    networks: [lakehouse]
+
+  # ---------------------------------------------------------------------------
+  # minio-init: contêiner descartável. Espera o MinIO ficar saudável, cria um
+  # bucket por camada e encerra. Rodar de novo não quebra nada (é idempotente).
+  # ---------------------------------------------------------------------------
+  minio-init:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: gabs-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    entrypoint: ["/bin/sh", "-c"]
+    # "$$" é como se escreve um "$" literal no Compose: a variável é lida
+    # dentro do contêiner, e não substituída pelo Compose.
+    command:
+      - |
+        set -e
+        mc alias set lake http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"
+        for bucket in landing bronze silver gold; do
+          mc mb --ignore-existing "lake/$$bucket"
+        done
+        echo "Buckets prontos:"
+        mc ls lake
+    restart: "no"
+    networks: [lakehouse]
+
+  # ---------------------------------------------------------------------------
+  # Jupyter: onde você escreve e roda PySpark. O Spark roda em modo local,
+  # dentro deste mesmo contêiner (driver e executores no mesmo processo).
+  #   porta 8888 = JupyterLab
+  #   porta 4040 = Spark UI (só existe enquanto há uma sessão Spark aberta)
+  # ---------------------------------------------------------------------------
+  jupyter:
+    build:
+      context: ./jupyter
+      args:
+        UID: ${HOST_UID:-1000}
+        GID: ${HOST_GID:-1000}
+    image: gabs-jupyter:fase1
+    container_name: gabs-jupyter
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      # "minio" aqui é o NOME DO SERVIÇO acima. Dentro da rede do Docker, cada
+      # serviço é alcançado pelo próprio nome, como se fosse um hostname.
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      SPARK_DRIVER_MEMORY: ${SPARK_DRIVER_MEMORY:-4g}
+      JUPYTER_TOKEN: ${JUPYTER_TOKEN}
+      # Faz "from gabs import ..." funcionar em qualquer notebook.
+      PYTHONPATH: /workspace
+    ports:
+      - "127.0.0.1:8888:8888"
+      - "127.0.0.1:4040:4040"
+    volumes:
+      # Caminhos relativos a ESTE arquivo (pasta docker/).
+      - ../gabs:/workspace/gabs
+      - ../notebooks:/workspace/notebooks
+    restart: unless-stopped
+    networks: [lakehouse]
+
+# Volume nomeado: o Docker cuida de onde os dados ficam no disco. Na VM, isso
+# cai em /data/docker (o disco de dados), por causa do daemon.json do startup.sh.
+volumes:
+  minio_data:
+
+# Rede própria: é o que permite um contêiner achar o outro pelo nome.
+networks:
+  lakehouse:
+    name: lakehouse
