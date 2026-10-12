@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Configuração do Hive Metastore. Usuário e senha do banco NÃO ficam aqui:
+     chegam por variável de ambiente (SERVICE_OPTS no docker-compose). -->
+<configuration>
+
+  <!-- Onde o catálogo é gravado: banco "metastore" no PostgreSQL -->
+  <property>
+    <name>javax.jdo.option.ConnectionURL</name>
+    <value>jdbc:postgresql://postgres:5432/metastore</value>
+  </property>
+  <property>
+    <name>javax.jdo.option.ConnectionDriverName</name>
+    <value>org.postgresql.Driver</value>
+  </property>
+
+  <!-- Destino padrão de tabelas criadas sem LOCATION -->
+  <property>
+    <name>hive.metastore.warehouse.dir</name>
+    <value>s3a://warehouse/</value>
+  </property>
+
+  <!-- O schema é criado pelo schematool (start-metastore.sh), nunca automaticamente -->
+  <property>
+    <name>datanucleus.autoCreateSchema</name>
+    <value>false</value>
+  </property>
+  <property>
+    <name>hive.metastore.schema.verification</name>
+    <value>true</value>
+  </property>
+
+  <!-- Clientes como Spark e Trino não precisam de autorização para eventos -->
+  <property>
+    <name>hive.metastore.event.db.notification.api.auth</name>
+    <value>false</value>
+  </property>
+
+</configuration>

@@ -1,31 +1,56 @@
 # =============================================================================
-# Gabs Data Framework - Fase 1: núcleo do lakehouse
+# Gabs Data Framework - plataforma local (fases 1 a 5)
 #
-#   minio       -> o data lake (object storage compatível com S3)
-#   minio-init  -> roda uma vez, cria os buckets das camadas e termina
-#   jupyter     -> JupyterLab + PySpark + Delta Lake (Spark em modo local)
+# Os serviços são agrupados em "profiles". A BASE sobe sempre; os demais só
+# quando você pede o profile. Assim a plataforma cabe numa máquina com poucos recursos por exemplo.
 #
-# Subir (a partir da RAIZ do repositório):
-#   docker compose -f docker/docker-compose.yml --env-file .env up -d --build
-# Parar:
-#   docker compose -f docker/docker-compose.yml --env-file .env down
+#   base (sempre) : minio, minio-init, postgres, hive-metastore   ~1,5 GB
+#   lab           : jupyter                                       ~2 GB
+#   pipeline      : airflow (com Spark dentro)                    ~3 GB
+#   sql           : trino                                         ~1,7 GB
+#   bi            : trino + metabase                              ~2,9 GB
 #
-# Todas as portas ficam presas em 127.0.0.1: só quem está "dentro" da máquina
-# enxerga. Na VM, o acesso é por túnel SSH; nada fica exposto à internet.
+# Exemplos, a partir da RAIZ do repositório:
+#   docker compose -f docker/docker-compose.yml --env-file .env --profile pipeline up -d --build
+#   docker compose -f docker/docker-compose.yml --env-file .env --profile bi up -d
+#   docker compose -f docker/docker-compose.yml --env-file .env --profile "*" down
+#
+# As portas ficam presas em BIND_ADDR (padrão 127.0.0.1). Num servidor da sua
+# rede de casa, BIND_ADDR=0.0.0.0 permite abrir as telas de outro computador.
 # =============================================================================
 
 name: gabs
 
+# -----------------------------------------------------------------------------
+# Blocos reutilizáveis (âncoras YAML). Definidos uma vez, usados em vários
+# serviços. É o que garante que Jupyter e Airflow tenham EXATAMENTE as mesmas
+# versões de Spark, Delta e conectores.
+# -----------------------------------------------------------------------------
+x-spark-build-args: &spark-build-args
+  PYSPARK_VERSION: "3.5.6"
+  DELTA_VERSION: "3.3.2"
+  HADOOP_AWS_VERSION: "3.3.4"
+  AWS_SDK_VERSION: "1.12.262"
+  POSTGRES_JDBC_VERSION: "42.7.4"
+
+x-spark-env: &spark-env
+  S3_ENDPOINT: http://minio:9000
+  S3_ACCESS_KEY: ${MINIO_ROOT_USER}
+  S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+  HIVE_METASTORE_URI: thrift://hive-metastore:9083
+  SPARK_SHUFFLE_PARTITIONS: "4"
+
 services:
 
+  # ===========================================================================
+  # BASE
+  # ===========================================================================
+
   # ---------------------------------------------------------------------------
-  # MinIO: guarda os arquivos (Parquet, Delta, JSON...) como objetos em buckets
-  #   porta 9000 = API S3 (é com ela que o Spark conversa)
-  #   porta 9001 = console web (para você navegar nos buckets)
+  # MinIO (Silo): o data lake. 9000 = API S3, 9001 = console web.
   # ---------------------------------------------------------------------------
   minio:
     # Silo: fork mantido do MinIO (mesma API, mesmas variáveis, mesmo console).
-    # A imagem oficial minio/minio foi retirada do Docker Hub.
     image: pgsty/silo:RELEASE.2026-09-16T00-00-00Z
     container_name: gabs-minio
     command: server /data --console-address ":9001"
@@ -33,23 +58,21 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:?defina MINIO_ROOT_USER no .env}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?defina MINIO_ROOT_PASSWORD no .env}
     ports:
-      - "127.0.0.1:9000:9000"
-      - "127.0.0.1:9001:9001"
+      - "${BIND_ADDR:-127.0.0.1}:9000:9000"
+      - "${BIND_ADDR:-127.0.0.1}:9001:9001"
     volumes:
       - minio_data:/data
     healthcheck:
-      # "mcli" é o cliente de linha de comando que vem dentro da imagem.
       test: ["CMD", "mcli", "ready", "local"]
-      interval: 5s
+      interval: 10s
       timeout: 5s
-      retries: 12
+      retries: 18
+    mem_limit: 384m
     restart: unless-stopped
     networks: [lakehouse]
 
-  # ---------------------------------------------------------------------------
-  # minio-init: contêiner descartável. Espera o MinIO ficar saudável, cria um
-  # bucket por camada e encerra. Rodar de novo não quebra nada (é idempotente).
-  # ---------------------------------------------------------------------------
+  # Cria um bucket por camada, mais o "warehouse" (destino padrão de tabelas
+  # criadas sem LOCATION). Roda uma vez e termina.
   minio-init:
     image: pgsty/silo:RELEASE.2026-09-16T00-00-00Z
     container_name: gabs-minio-init
@@ -57,57 +80,216 @@ services:
       minio:
         condition: service_healthy
     environment:
-      # MC_HOST_<apelido> registra um servidor para o cliente, no formato
-      # http://usuario:senha@host:porta. Aqui o apelido é "lake".
       MC_HOST_lake: http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@minio:9000
     entrypoint: ["mcli"]
-    command: ["mb", "--ignore-existing", "lake/landing", "lake/bronze", "lake/silver", "lake/gold"]
+    command: ["mb", "--ignore-existing", "lake/landing", "lake/bronze", "lake/silver", "lake/gold", "lake/warehouse"]
     restart: "no"
     networks: [lakehouse]
 
   # ---------------------------------------------------------------------------
-  # Jupyter: onde você escreve e roda PySpark. O Spark roda em modo local,
-  # dentro deste mesmo contêiner (driver e executores no mesmo processo).
-  #   porta 8888 = JupyterLab
-  #   porta 4040 = Spark UI (só existe enquanto há uma sessão Spark aberta)
+  # PostgreSQL: um servidor, quatro bancos (criados pelo postgres/init.sql):
+  #   metastore -> catálogo do Hive     airflow -> estado do Airflow
+  #   metabase  -> configuração do BI   fonte   -> sistema de origem simulado
   # ---------------------------------------------------------------------------
-  jupyter:
-    build:
-      context: ./jupyter
-      args:
-        UID: ${HOST_UID:-1000}
-        GID: ${HOST_GID:-1000}
-    image: gabs-jupyter:fase1
-    container_name: gabs-jupyter
-    depends_on:
-      minio-init:
-        condition: service_completed_successfully
+  postgres:
+    image: postgres:16-alpine
+    container_name: gabs-postgres
     environment:
-      # "minio" aqui é o NOME DO SERVIÇO acima. Dentro da rede do Docker, cada
-      # serviço é alcançado pelo próprio nome, como se fosse um hostname.
-      S3_ENDPOINT: http://minio:9000
-      S3_ACCESS_KEY: ${MINIO_ROOT_USER}
-      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
-      SPARK_DRIVER_MEMORY: ${SPARK_DRIVER_MEMORY:-4g}
-      JUPYTER_TOKEN: ${JUPYTER_TOKEN:?defina JUPYTER_TOKEN no .env}
-      # Faz "from gabs import ..." funcionar em qualquer notebook.
-      PYTHONPATH: /workspace
+      POSTGRES_USER: ${POSTGRES_USER:?defina POSTGRES_USER no .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD no .env}
     ports:
-      - "127.0.0.1:8888:8888"
-      - "127.0.0.1:4040:4040"
+      - "${BIND_ADDR:-127.0.0.1}:5432:5432"
     volumes:
-      # Caminhos relativos a ESTE arquivo (pasta docker/).
-      - ../gabs:/workspace/gabs
-      - ../notebooks:/workspace/notebooks
+      - postgres_data:/var/lib/postgresql/data
+      # Scripts nesta pasta rodam só na PRIMEIRA vez, com o volume vazio.
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+    mem_limit: 384m
     restart: unless-stopped
     networks: [lakehouse]
 
-# Volume nomeado: o Docker cuida de onde os dados ficam no disco. Na VM, isso
-# cai em /data/docker (o disco de dados), por causa do daemon.json do startup.sh.
+  # ---------------------------------------------------------------------------
+  # Hive Metastore: o catálogo. Guarda, no banco "metastore", quais tabelas
+  # existem, o schema de cada uma e em que caminho do MinIO estão os arquivos.
+  # Spark registra as tabelas aqui; Trino as encontra aqui.
+  # ---------------------------------------------------------------------------
+  hive-metastore:
+    build: ./hive
+    image: gabs-hive-metastore:3.1.3
+    container_name: gabs-hive-metastore
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      # Usuário e senha do banco vão como propriedades Java (-D...), lidas
+      # pelo Hive no lugar do que estiver no hive-site.xml.
+      SERVICE_OPTS: >-
+        -Xmx512m
+        -Djavax.jdo.option.ConnectionUserName=${POSTGRES_USER}
+        -Djavax.jdo.option.ConnectionPassword=${POSTGRES_PASSWORD}
+      # O conector S3A lê as credenciais destas duas variáveis.
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      HADOOP_CONF_DIR: /opt/hive/conf
+    volumes:
+      - ./hive/hive-site.xml:/opt/hive/conf/hive-site.xml:ro
+      - ./hive/core-site.xml:/opt/hive/conf/core-site.xml:ro
+    healthcheck:
+      # Saudável quando a porta 9083 (Thrift) aceita conexão.
+      test: ["CMD", "bash", "-c", "</dev/tcp/127.0.0.1/9083"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 120s
+    mem_limit: 768m
+    restart: unless-stopped
+    networks: [lakehouse]
+
+  # ===========================================================================
+  # PROFILE lab
+  # ===========================================================================
+
+  # JupyterLab com Spark local. 8888 = JupyterLab, 4040 = Spark UI.
+  jupyter:
+    profiles: [lab]
+    build:
+      context: ./jupyter
+      args:
+        <<: *spark-build-args
+        UID: ${HOST_UID:-1000}
+        GID: ${HOST_GID:-1000}
+    image: gabs-jupyter:fase2
+    container_name: gabs-jupyter
+    depends_on:
+      hive-metastore:
+        condition: service_healthy
+    environment:
+      <<: *spark-env
+      SPARK_DRIVER_MEMORY: ${SPARK_DRIVER_MEMORY:-1g}
+      JUPYTER_TOKEN: ${JUPYTER_TOKEN:?defina JUPYTER_TOKEN no .env}
+      PYTHONPATH: /workspace
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:8888:8888"
+      - "${BIND_ADDR:-127.0.0.1}:4040:4040"
+    volumes:
+      - ../gabs:/workspace/gabs
+      - ../notebooks:/workspace/notebooks
+    mem_limit: 2g
+    restart: unless-stopped
+    networks: [lakehouse]
+
+  # ===========================================================================
+  # PROFILE pipeline
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Airflow em modo "standalone": scheduler, dag-processor, api-server e
+  # triggerer num único contêiner, com LocalExecutor, apenas para estudo; em
+  # produção cada componente roda separado. Os jobs Spark rodam DENTRO dele.
+  # ---------------------------------------------------------------------------
+  airflow:
+    profiles: [pipeline]
+    build:
+      context: ./airflow
+      args:
+        <<: *spark-build-args
+    image: gabs-airflow:fase2
+    container_name: gabs-airflow
+    command: standalone
+    depends_on:
+      postgres:
+        condition: service_healthy
+      hive-metastore:
+        condition: service_healthy
+    environment:
+      <<: *spark-env
+      SPARK_DRIVER_MEMORY: 1g
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/airflow
+      AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:?defina AIRFLOW_JWT_SECRET no .env}
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+      # No máximo 2 tarefas ao mesmo tempo: cada uma pode abrir um Spark.
+      AIRFLOW__CORE__PARALLELISM: "2"
+      # Banco de origem do pipeline de exemplo.
+      FONTE_JDBC_URL: jdbc:postgresql://postgres:5432/fonte
+      FONTE_USER: ${POSTGRES_USER}
+      FONTE_PASSWORD: ${POSTGRES_PASSWORD}
+      # Faz "from gabs import ..." funcionar dentro das DAGs.
+      PYTHONPATH: /opt/gabs_dataframework
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:8080:8080"
+    volumes:
+      - ../dags:/opt/airflow/dags:ro
+      - ../gabs:/opt/gabs_dataframework/gabs:ro
+    mem_limit: 3g
+    restart: unless-stopped
+    networks: [lakehouse]
+
+  # ===========================================================================
+  # PROFILES sql e bi
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Trino: SQL sobre o lake. Pergunta ao Metastore onde está cada tabela e lê
+  # os arquivos direto do MinIO. Porta 8080 no contêiner, 8085 na máquina
+  # (a 8080 já é do Airflow).
+  # ---------------------------------------------------------------------------
+  trino:
+    profiles: [sql, bi]
+    image: trinodb/trino:483
+    container_name: gabs-trino
+    depends_on:
+      hive-metastore:
+        condition: service_healthy
+    environment:
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:8085:8080"
+    volumes:
+      - ./trino/jvm.config:/etc/trino/jvm.config:ro
+      - ./trino/catalog/delta.properties:/etc/trino/catalog/delta.properties:ro
+    mem_limit: 1700m
+    restart: unless-stopped
+    networks: [lakehouse]
+
+  # ---------------------------------------------------------------------------
+  # Metabase: visualização. Guarda a própria configuração no banco "metabase"
+  # e consulta os dados pelo Trino. Porta 3000.
+  # ---------------------------------------------------------------------------
+  metabase:
+    profiles: [bi]
+    image: metabase/metabase:latest
+    container_name: gabs-metabase
+    depends_on:
+      postgres:
+        condition: service_healthy
+      trino:
+        condition: service_started
+    environment:
+      MB_DB_TYPE: postgres
+      MB_DB_HOST: postgres
+      MB_DB_PORT: "5432"
+      MB_DB_DBNAME: metabase
+      MB_DB_USER: ${POSTGRES_USER}
+      MB_DB_PASS: ${POSTGRES_PASSWORD}
+      JAVA_OPTS: -Xmx768m
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:3000:3000"
+    mem_limit: 1200m
+    restart: unless-stopped
+    networks: [lakehouse]
+
 volumes:
   minio_data:
+  postgres_data:
 
-# Rede própria: é o que permite um contêiner achar o outro pelo nome.
 networks:
   lakehouse:
     name: lakehouse
