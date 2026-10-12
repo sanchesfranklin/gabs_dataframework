@@ -197,5 +197,5 @@ A pasta `infra/terraform` cria a rede, o firewall restrito, a VM com Docker e um
 
 ---
 
-© 2026 Sanches Franklin. Todos os direitos reservados.
+© 2026 Sanches Franklin.
 Projeto de estudo. O código está disponível para consulta, sem licença de uso.
