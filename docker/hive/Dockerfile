@@ -18,7 +18,10 @@ RUN cp /opt/hadoop/share/hadoop/tools/lib/hadoop-aws-*.jar \
        /opt/hadoop/share/hadoop/tools/lib/aws-java-sdk-bundle-*.jar \
        /opt/hive/lib/
 
-# 2. Driver JDBC do PostgreSQL, onde o catálogo fica gravado.
+# 2. Driver JDBC do PostgreSQL, onde o catálogo fica gravado. O Hive 3.1.3 traz
+#    um driver de 2016 que não suporta a autenticação SCRAM-SHA-256, padrão do
+#    PostgreSQL desde a versão 14. Ele é removido e trocado por um atual.
+RUN rm -f /opt/hive/lib/postgresql-*.jar
 ADD https://repo1.maven.org/maven2/org/postgresql/postgresql/${POSTGRES_JDBC_VERSION}/postgresql-${POSTGRES_JDBC_VERSION}.jar \
     /opt/hive/lib/postgresql.jar
 
