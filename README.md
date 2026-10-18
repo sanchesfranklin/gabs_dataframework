@@ -11,7 +11,7 @@ Os pipelines de cada produto ficam em repositórios próprios, clonados dentro d
 
 ## Objetivo
 
-Criar uma arquitetura moderna de pipelines de dados, entendendo o papel de cada peça e como elas se conectam:
+Criar uma arquitetura moderna de pipelines de dados:
 
 - armazenamento separado do processamento;
 - dados organizados em camadas (arquitetura medalhão);
@@ -32,6 +32,8 @@ flowchart LR
 
     G --> T["Trino"] --> V["Metabase"]
 ```
+
+![Arquitetura do Gabs Data Framework](ARQUITETURA_GABS.png)
 
 O Spark, com Delta Lake, faz as transformações entre as camadas. O Airflow orquestra a execução, o Hive Metastore registra as tabelas e o OpenMetadata documenta o que existe e de onde veio.
 
