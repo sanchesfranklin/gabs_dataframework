@@ -14,6 +14,7 @@ Assim a mesma tabela é encontrada pelo nome em qualquer ferramenta:
 A camada landing não entra aqui: ela guarda arquivos brutos, não tabelas.
 """
 
+from delta.tables import DeltaTable
 from pyspark.sql import DataFrame, SparkSession
 
 from gabs import storage
@@ -50,7 +51,7 @@ def write_table(
     replace_where: str | None = None,
     partition_by: list[str] | None = None,
 ) -> None:
-    """Grava o DataFrame como tabela Delta e a registra no catálogo.
+    """Grava o DataFrame como tabela Delta e garante o registro no catálogo.
 
     replace_where: condição que delimita a fatia a substituir, por exemplo
         "DT_REFERENCIA = '2026-09-10'". Só essa fatia é trocada; o resto da
@@ -59,28 +60,35 @@ def write_table(
     partition_by: colunas de partição. Usar a mesma coluna do replace_where
         faz o Delta trocar só os arquivos daquela partição.
     """
-    name = table_name(layer, product, table)
     path = storage.path(layer, product, table)
     spark = df.sparkSession
-    ensure_schema(spark, layer)
 
     writer = df.write.format("delta").mode(mode)
     if partition_by:
         writer = writer.partitionBy(*partition_by)
 
-    if replace_where and spark.catalog.tableExists(name):
-        # Tabela já existe: grava pelo caminho, trocando só a fatia indicada.
-        # O registro no catálogo continua o mesmo (ele só guarda o endereço).
-        writer.option("replaceWhere", replace_where).save(path)
-        return
-
-    if mode == "overwrite" and not replace_where:
-        # Permite que uma nova versão mude colunas (útil enquanto se desenvolve).
+    if replace_where and DeltaTable.isDeltaTable(spark, path):
+        # A tabela já existe: troca só a fatia indicada.
+        writer = writer.option("replaceWhere", replace_where)
+    elif mode == "overwrite":
+        # Primeira gravação, ou substituição completa: aceita mudança de colunas.
         writer = writer.option("overwriteSchema", "true")
 
-    # Primeira gravação (ou substituição completa): cria a tabela EXTERNA no
-    # caminho da convenção e a registra no catálogo.
-    writer.option("path", path).saveAsTable(name)
+    writer.save(path)
+    register_table(spark, layer, product, table)
+
+
+def register_table(spark: SparkSession, layer: str, product: str, table: str) -> None:
+    """Registra no catálogo a tabela Delta que está no caminho da convenção.
+
+    Se já estiver registrada, não faz nada. A tabela é EXTERNA: apagar o
+    registro não apaga os arquivos.
+    """
+    ensure_schema(spark, layer)
+    spark.sql(
+        f"CREATE TABLE IF NOT EXISTS {table_name(layer, product, table)} "
+        f"USING DELTA LOCATION '{storage.path(layer, product, table)}'"
+    )
 
 
 def read_table(spark: SparkSession, layer: str, product: str, table: str) -> DataFrame:
