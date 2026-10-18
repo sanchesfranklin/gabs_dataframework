@@ -47,30 +47,60 @@ def write_table(
     product: str,
     table: str,
     mode: str = "overwrite",
+    replace_where: str | None = None,
+    partition_by: list[str] | None = None,
 ) -> None:
     """Grava o DataFrame como tabela Delta e a registra no catálogo.
 
-    mode="overwrite" substitui o conteúdo (cria uma nova versão no Delta, a
-    anterior continua acessível por time travel). Rodar duas vezes com os
-    mesmos dados dá o mesmo resultado: o job é idempotente.
+    replace_where: condição que delimita a fatia a substituir, por exemplo
+        "DT_REFERENCIA = '2026-09-10'". Só essa fatia é trocada; o resto da
+        tabela fica intacto. É o que torna uma carga incremental idempotente:
+        repetir o mesmo dia substitui o mesmo dia, sem duplicar.
+    partition_by: colunas de partição. Usar a mesma coluna do replace_where
+        faz o Delta trocar só os arquivos daquela partição.
     """
     name = table_name(layer, product, table)
-    ensure_schema(df.sparkSession, layer)
+    path = storage.path(layer, product, table)
+    spark = df.sparkSession
+    ensure_schema(spark, layer)
 
-    writer = (
-        df.write.format("delta")
-        .mode(mode)
-        # "path" torna a tabela EXTERNA: os arquivos ficam no caminho da
-        # convenção, e o catálogo só guarda o endereço.
-        .option("path", storage.path(layer, product, table))
-    )
-    if mode == "overwrite":
+    writer = df.write.format("delta").mode(mode)
+    if partition_by:
+        writer = writer.partitionBy(*partition_by)
+
+    if replace_where and spark.catalog.tableExists(name):
+        # Tabela já existe: grava pelo caminho, trocando só a fatia indicada.
+        # O registro no catálogo continua o mesmo (ele só guarda o endereço).
+        writer.option("replaceWhere", replace_where).save(path)
+        return
+
+    if mode == "overwrite" and not replace_where:
         # Permite que uma nova versão mude colunas (útil enquanto se desenvolve).
         writer = writer.option("overwriteSchema", "true")
 
-    writer.saveAsTable(name)
+    # Primeira gravação (ou substituição completa): cria a tabela EXTERNA no
+    # caminho da convenção e a registra no catálogo.
+    writer.option("path", path).saveAsTable(name)
 
 
 def read_table(spark: SparkSession, layer: str, product: str, table: str) -> DataFrame:
     """Lê uma tabela pelo nome no catálogo."""
     return spark.read.table(table_name(layer, product, table))
+
+
+def drop_table(spark: SparkSession, layer: str, product: str, table: str) -> None:
+    """Remove a tabela do catálogo E apaga os arquivos dela no storage.
+
+    Uso pontual, para recomeçar uma tabela do zero (por exemplo, ao mudar a
+    estrutura). Não existe desfazer.
+    """
+    spark.sql(f"DROP TABLE IF EXISTS {table_name(layer, product, table)}")
+    delete_path(spark, storage.path(layer, product, table))
+
+
+def delete_path(spark: SparkSession, path: str) -> None:
+    """Apaga uma pasta inteira no storage, pelo sistema de arquivos do Hadoop."""
+    jvm_path = spark._jvm.org.apache.hadoop.fs.Path(path)
+    fs = jvm_path.getFileSystem(spark._jsc.hadoopConfiguration())
+    if fs.exists(jvm_path):
+        fs.delete(jvm_path, True)

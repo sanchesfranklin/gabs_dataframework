@@ -205,7 +205,7 @@ dc --profile "*" down                    # para tudo (os dados são preservados)
 | `gabs-minio-init` | `Exited (0)`, pois só cria os buckets e termina |
 | `gabs-airflow`, `gabs-trino`, `gabs-metabase`, `gabs-jupyter` | `Up`, conforme o profile |
 
-O Hive Metastore demora alguns minutos para ficar `healthy` na primeira vez, porque cria o próprio schema no PostgreSQL.
+O Hive Metastore demora alguns minutos para ficar `healthy` na primeira vez, porque cria o próprio schema no PostgreSQL, se demorar demais veja o log.
 
 ### 4. Acessar
 
@@ -232,7 +232,7 @@ docker exec gabs-airflow cat /opt/airflow/simple_auth_manager_passwords.json.gen
 2. As quatro tarefas rodam em sequência: `landing`, `bronze`, `silver` e `gold`.
 3. No console do MinIO, os buckets passam a ter os arquivos de cada camada.
 
-Depois, com o profile `sql` ou `bi`, consulte pelo Trino:
+Depois, com o profile `sql` ou `bi`, consulte pelo Trino (A depender da memória derrube o perfil pipeline e suba o perfil bi):
 
 ```bash
 docker exec -it gabs-trino trino
