@@ -239,7 +239,7 @@ services:
   # ---------------------------------------------------------------------------
   trino:
     profiles: [sql, bi]
-    image: trinodb/trino:483
+    image: trinodb/trino:476
     container_name: gabs-trino
     depends_on:
       hive-metastore:
